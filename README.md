@@ -32,9 +32,9 @@ cd docker
 ./start-all.sh
 ```
 
-`start-all.sh` does everything, in order: creates `../.env` from `.env.example` if missing →
-`./download-dependencies.sh` (fetches every jar/plugin the custom images need) →
-`./build-all-images.sh` → brings up every service across every profile → registers the Debezium
+- `start-all.sh` does everything, in order: creates `../.env` from `.env.example` if missing →
+- `./download-dependencies.sh` (fetches every jar/plugin the custom images need) →
+- `./build-all-images.sh` → brings up every service across every profile → registers the Debezium
 source and Iceberg sink connectors → waits for the sink's first commit to create the `bronze`
 tables → runs `dbt run` + `dbt test`. It's idempotent — re-running reuses the existing `.env`,
 downloads, and connectors. When it finishes it prints every service endpoint.
@@ -93,25 +93,6 @@ SELECT * FROM iceberg.gold.gold_daily_revenue ORDER BY 1 DESC LIMIT 10;
 Airflow UI: **http://localhost:8088** (`admin`/`admin` by default) — unpause and trigger
 `lakehouse_pipeline`.
 
-## 💡 Notable design decisions
-
-- **Iceberg REST Catalog, not Hive Metastore** — `apache/iceberg-rest-fixture` backed by Postgres
-  (`JdbcCatalog`), avoiding the Hadoop/`hadoop-aws`/AWS-SDK jar-compatibility surface.
-- **Single MinIO bucket** — every Iceberg namespace lives under one `lakehouse` bucket's
-  `warehouse/` prefix; bucket count carries real per-bucket config/limit costs.
-- **No `raw/` landing zone** — the Apache-native Iceberg Kafka Connect sink
-  (`org.apache.iceberg.connect.IcebergSinkConnector`) writes structured rows straight into
-  `bronze` tables; the databricks fork is frozen at `0.6.19` with an open multi-table-routing bug
-  ([apache/iceberg#13457](https://github.com/apache/iceberg/issues/13457)).
-- **`docker/downloads/`** — one shared, gitignored folder for every jar/plugin fetched at build
-  time (`download-dependencies.sh`), so Dockerfiles just `COPY` from it instead of hitting the
-  network during `docker build`.
-- **dbt-spark schema-as-catalog workaround** — the thrift dbt-spark adapter has no real 3-level
-  `catalog.schema.table` addressing, so the dbt `schema` itself is set to the literal string
-  `lakehouse.silver` / `lakehouse.gold`; `macros/generate_schema_name.sql` passes it through
-  unmodified.
-- **dbt runs in its own venv inside the Airflow image** (`/opt/dbt-venv`), not Airflow's own
-  Python env — Airflow 2.10 and dbt-core 1.8 pin conflicting `click`/`jinja2`/`protobuf` ranges.
 
 ## 📂 Repository structure
 
