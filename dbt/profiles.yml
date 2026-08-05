@@ -1,0 +1,12 @@
+data_platform:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: thrift
+      host: "{{ env_var('SPARK_THRIFT_HOST', 'localhost') }}"
+      port: "{{ env_var('SPARK_THRIFT_PORT', '10000') | int }}"
+      schema: lakehouse.silver
+      threads: 2
+      connect_retries: 5
+      connect_timeout: 10

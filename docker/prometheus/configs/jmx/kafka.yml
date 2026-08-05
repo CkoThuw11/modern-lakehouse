@@ -1,0 +1,26 @@
+# JMX → Prometheus rules for the Kafka broker (KRaft, combined broker+controller).
+# Curated to the metrics that actually matter for this POC, not a full MBean dump.
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+rules:
+  # Broker throughput (messages/bytes in-out per second).
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(MessagesInPerSec|BytesInPerSec|BytesOutPerSec)><>OneMinuteRate'
+    name: kafka_server_broker_$1_oneminuterate
+    type: GAUGE
+
+  # Replication health.
+  - pattern: 'kafka.server<type=ReplicaManager, name=(UnderReplicatedPartitions|PartitionCount|LeaderCount)><>Value'
+    name: kafka_server_replicamanager_$1
+    type: GAUGE
+
+  # Controller state (active controller, offline/total partitions, topic count).
+  - pattern: 'kafka.controller<type=KafkaController, name=(ActiveControllerCount|OfflinePartitionsCount|GlobalTopicCount|GlobalPartitionCount)><>Value'
+    name: kafka_controller_$1
+    type: GAUGE
+
+  # Request latency by API.
+  - pattern: 'kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(\w+)><>Mean'
+    name: kafka_network_request_total_time_ms_mean
+    labels:
+      request: "$1"
+    type: GAUGE

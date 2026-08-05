@@ -1,0 +1,22 @@
+name: 'data_platform'
+version: '1.0.0'
+config-version: 2
+
+profile: 'data_platform'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  data_platform:
+    +file_format: iceberg
+    +materialized: table
+    silver:
+      +schema: lakehouse.silver
+    gold:
+      +schema: lakehouse.gold

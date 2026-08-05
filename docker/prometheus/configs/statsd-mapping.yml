@@ -1,0 +1,53 @@
+# Maps Airflow's dotted StatsD metric names → labelled Prometheus metrics.
+# Only the signals that matter are kept; everything else is dropped so the /metrics
+# endpoint stays meaningful instead of exploding into per-dag/per-task metric names.
+mappings:
+  # Scheduler liveness — increments every heartbeat; flatlines if the scheduler dies.
+  - match: "airflow.scheduler_heartbeat"
+    name: "airflow_scheduler_heartbeat_total"
+
+  # DAG run outcomes + timing (ms), labelled by dag.
+  - match: "airflow.dagrun.duration.success.*"
+    name: "airflow_dagrun_duration_success_ms"
+    labels:
+      dag_id: "$1"
+  - match: "airflow.dagrun.duration.failed.*"
+    name: "airflow_dagrun_duration_failed_ms"
+    labels:
+      dag_id: "$1"
+  - match: "airflow.dagrun.schedule_delay.*"
+    name: "airflow_dagrun_schedule_delay_ms"
+    labels:
+      dag_id: "$1"
+
+  # Per-task duration (ms), labelled by dag + task.
+  - match: "airflow.dag.*.*.duration"
+    name: "airflow_task_duration_ms"
+    labels:
+      dag_id: "$1"
+      task_id: "$2"
+
+  # Task-instance success/failure counters.
+  - match: "airflow.ti_successes"
+    name: "airflow_task_instance_successes_total"
+  - match: "airflow.ti_failures"
+    name: "airflow_task_instance_failures_total"
+
+  # Operator-level success/failure counters, labelled by operator. Regex (not glob):
+  # the operator name is a suffix within a single dotted segment, not its own segment.
+  - match: "airflow\\.operator_successes_(.+)"
+    match_type: regex
+    name: "airflow_operator_successes_total"
+    labels:
+      operator: "$1"
+  - match: "airflow\\.operator_failures_(.+)"
+    match_type: regex
+    name: "airflow_operator_failures_total"
+    labels:
+      operator: "$1"
+
+  # Drop anything not explicitly mapped above (keeps cardinality sane).
+  - match: "."
+    match_type: regex
+    action: drop
+    name: "airflow_dropped"

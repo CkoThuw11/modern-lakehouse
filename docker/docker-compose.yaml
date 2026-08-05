@@ -1,0 +1,512 @@
+networks:
+  data-platform:
+    name: data-platform
+
+volumes:
+  minio-data:
+  iceberg-rest-db-data:
+  postgres-data:
+  kafka-data:
+  airflow-db-data:
+  airflow-logs:
+  grafana-data:
+  prometheus-data:
+
+# Shared config for every Airflow process (webserver, scheduler, init). dbt lives in
+# the baked-in /opt/dbt-venv; the DAG bind-mounts the dbt project and talks to Spark
+# Thrift + Kafka Connect over the network by service name.
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  image: data-platform-airflow:latest
+  profiles: ["orchestration"]
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Emit metrics over StatsD → statsd-exporter → Prometheus (obs profile). Best-effort
+    # UDP; harmless when the obs profile isn't running.
+    AIRFLOW__METRICS__STATSD_ON: "true"
+    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: "9125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    # Consumed by the DAG (dbt profiles.yml + connector checks) — identical wiring to
+    # the standalone dbt-spark container and Kafka Connect.
+    SPARK_THRIFT_HOST: spark
+    SPARK_THRIFT_PORT: "10000"
+    KAFKA_CONNECT_URL: http://kafka-connect:8083
+  volumes:
+    - ../airflow/dags:/opt/airflow/dags:ro
+    - ../dbt:/opt/airflow/dbt
+    - airflow-logs:/opt/airflow/logs
+  networks:
+    - data-platform
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: minio
+    profiles: ["core", "lakehouse"]
+    command: server /data --address ":${MINIO_PORT}" --console-address ":${MINIO_CONSOLE_PORT}"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Expose /minio/v2/metrics/* without auth so Prometheus can scrape the cluster.
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    ports:
+      - "${MINIO_PORT}:${MINIO_PORT}"
+      - "${MINIO_CONSOLE_PORT}:${MINIO_CONSOLE_PORT}"
+    volumes:
+      - minio-data:/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: minio-init
+    profiles: ["core", "lakehouse"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - data-platform
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:${MINIO_PORT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/lakehouse
+      "
+
+  iceberg-rest-db:
+    image: postgres:15
+    container_name: iceberg-rest-db
+    profiles: ["lakehouse"]
+    environment:
+      POSTGRES_USER: ${ICEBERG_REST_DB_USER}
+      POSTGRES_PASSWORD: ${ICEBERG_REST_DB_PASSWORD}
+      POSTGRES_DB: ${ICEBERG_REST_DB_NAME}
+    volumes:
+      - iceberg-rest-db-data:/var/lib/postgresql/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ICEBERG_REST_DB_USER} -d ${ICEBERG_REST_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  iceberg-rest:
+    build:
+      context: .
+      dockerfile: iceberg-rest/Dockerfile
+    container_name: iceberg-rest
+    profiles: ["lakehouse"]
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-rest-db:
+        condition: service_healthy
+    environment:
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://iceberg-rest-db:5432/${ICEBERG_REST_DB_NAME}
+      CATALOG_JDBC_USER: ${ICEBERG_REST_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_REST_DB_PASSWORD}
+      CATALOG_WAREHOUSE: s3://lakehouse/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:${MINIO_PORT}
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_S3_ACCESS__KEY__ID: ${MINIO_ROOT_USER}
+      CATALOG_S3_SECRET__ACCESS__KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    ports:
+      - "8181:8181"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  postgres:
+    build: ./postgres
+    container_name: postgres
+    profiles: ["core"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: kafka
+    profiles: ["streaming"]
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # JMX → Prometheus agent on :7071 (broker throughput, replication, controller).
+      KAFKA_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7071:/opt/jmx/kafka.yml"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./downloads/jmx_prometheus_javaagent-0.20.0.jar:/opt/jmx/jmx_prometheus_javaagent.jar:ro
+      - ./prometheus/configs/jmx/kafka.yml:/opt/jmx/kafka.yml:ro
+    networks:
+      - data-platform
+    healthcheck:
+      # Clear KAFKA_OPTS for the check: otherwise the CLI JVM would try to bind the
+      # JMX-exporter agent's :7071 (already held by the broker) and fail.
+      test: ["CMD-SHELL", "KAFKA_OPTS= /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    profiles: ["streaming"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+    ports:
+      - "8081:8081"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/subjects"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  akhq:
+    image: tchiotludo/akhq:0.24.0
+    container_name: akhq
+    profiles: ["streaming"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      AKHQ_CONFIGURATION: >
+        akhq:
+          connections:
+            docker-kafka-server:
+              properties:
+                bootstrap.servers: "kafka:9092"
+              schema-registry:
+                url: "http://schema-registry:8081"
+    ports:
+      - "8080:8080"
+    networks:
+      - data-platform
+
+  kafka-connect:
+    build:
+      context: .
+      dockerfile: kafka-connect/Dockerfile
+    container_name: kafka-connect
+    profiles: ["streaming"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: kafka-connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+      # JMX → Prometheus agent on :7072 (connector/task health, sink consumer lag).
+      KAFKA_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7072:/opt/jmx/connect.yml"
+    volumes:
+      - ./downloads/jmx_prometheus_javaagent-0.20.0.jar:/opt/jmx/jmx_prometheus_javaagent.jar:ro
+      - ./prometheus/configs/jmx/connect.yml:/opt/jmx/connect.yml:ro
+    ports:
+      - "8083:8083"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8083/connectors"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  spark:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: spark
+    profiles: ["lakehouse"]
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --class
+      - org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      - --name
+      - Thrift JDBC/ODBC Server
+      - --master
+      - local[*]
+      - --conf
+      - spark.hive.server2.thrift.port=10000
+      - --conf
+      - spark.hive.server2.thrift.bind.host=0.0.0.0
+      - --conf
+      - spark.sql.catalog.lakehouse.s3.endpoint=http://minio:${MINIO_PORT}
+      - --conf
+      - spark.sql.catalog.lakehouse.s3.access-key-id=${MINIO_ROOT_USER}
+      - --conf
+      - spark.sql.catalog.lakehouse.s3.secret-access-key=${MINIO_ROOT_PASSWORD}
+      - --conf
+      - spark.hadoop.fs.s3a.endpoint=http://minio:${MINIO_PORT}
+      - --conf
+      - spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER}
+      - --conf
+      - spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+      - spark-internal
+    volumes:
+      # Native Prometheus metrics on the driver UI (:4040/metrics/prometheus/).
+      - ./spark/configs/metrics.properties:/opt/spark/conf/metrics.properties:ro
+    ports:
+      - "10000:10000"
+      - "4040:4040"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  dbt-spark:
+    build: ./dbt-spark
+    container_name: dbt-spark
+    profiles: ["lakehouse"]
+    depends_on:
+      spark:
+        condition: service_healthy
+    environment:
+      SPARK_THRIFT_HOST: spark
+      SPARK_THRIFT_PORT: "10000"
+    volumes:
+      - ../dbt:/usr/app/dbt
+    networks:
+      - data-platform
+
+  trino:
+    image: trinodb/trino:462
+    container_name: trino
+    profiles: ["bi"]
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    environment:
+      # Consumed by trino/configs/catalog/iceberg.properties via ${ENV:...} substitution,
+      # keeping MinIO/S3 settings identical to the REST Catalog / Spark / Kafka Connect.
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    # Config only — no Dockerfile. Mount just the Iceberg catalog; the image's built-in
+    # /etc/trino/{config,node,jvm} defaults run a single-node coordinator out of the box.
+    volumes:
+      - ./trino/configs/catalog:/etc/trino/catalog:ro
+    ports:
+      - "8085:8080"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "trino --execute 'SELECT 1' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  airflow-db:
+    image: postgres:15
+    container_name: airflow-db
+    profiles: ["orchestration"]
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: migrate the metadata DB and create the admin user, then exit. The
+  # long-running services gate on this completing successfully.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER}" --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname admin --lastname admin --role Admin --email admin@example.com
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --local || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+
+  # ---- Observability (profile: obs) ---------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    profiles: ["obs"]
+    # Render __MINIO_PORT__ from .env (Compose substitutes ${MINIO_PORT} into the command)
+    # so the MinIO scrape target's port never drifts from the rest of the stack.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sed "s/__MINIO_PORT__/${MINIO_PORT}/g" /etc/prometheus/prometheus.tmpl.yml > /tmp/prometheus.yml
+        exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=:9090
+    volumes:
+      - ./prometheus/configs/prometheus.yml:/etc/prometheus/prometheus.tmpl.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    profiles: ["obs"]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    networks:
+      - data-platform
+
+  # Source Postgres exporter — replication-slot lag (CDC health), connections, up.
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter
+    profiles: ["obs"]
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+    networks:
+      - data-platform
+
+  # Receives Airflow StatsD (UDP :9125), exposes Prometheus metrics (:9102).
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.27.1
+    container_name: statsd-exporter
+    profiles: ["obs"]
+    command:
+      - "--statsd.mapping-config=/etc/statsd/mapping.yml"
+      - "--statsd.listen-udp=:9125"
+      - "--web.listen-address=:9102"
+    volumes:
+      - ./prometheus/configs/statsd-mapping.yml:/etc/statsd/mapping.yml:ro
+    networks:
+      - data-platform

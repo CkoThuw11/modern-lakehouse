@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: gold_daily_revenue
+    description: Revenue and order count per calendar day.
+    columns:
+      - name: order_date
+        tests:
+          - not_null
+          - unique
+
+  - name: gold_customer_lifetime_value
+    description: Lifetime order count and revenue per customer.
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
