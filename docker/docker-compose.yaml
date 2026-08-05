@@ -9,8 +9,6 @@ volumes:
   kafka-data:
   airflow-db-data:
   airflow-logs:
-  grafana-data:
-  prometheus-data:
 
 # Shared config for every Airflow process (webserver, scheduler, init). dbt lives in
 # the baked-in /opt/dbt-venv; the DAG bind-mounts the dbt project and talks to Spark
@@ -28,14 +26,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_FERNET_KEY}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    # Emit metrics over StatsD → statsd-exporter → Prometheus (obs profile). Best-effort
-    # UDP; harmless when the obs profile isn't running.
-    AIRFLOW__METRICS__STATSD_ON: "true"
-    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
-    AIRFLOW__METRICS__STATSD_PORT: "9125"
-    AIRFLOW__METRICS__STATSD_PREFIX: airflow
-    # Consumed by the DAG (dbt profiles.yml + connector checks) — identical wiring to
-    # the standalone dbt-spark container and Kafka Connect.
+    # Consumed by the DAG (dbt profiles.yml + connector checks).
     SPARK_THRIFT_HOST: spark
     SPARK_THRIFT_PORT: "10000"
     KAFKA_CONNECT_URL: http://kafka-connect:8083
@@ -55,8 +46,6 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      # Expose /minio/v2/metrics/* without auth so Prometheus can scrape the cluster.
-      MINIO_PROMETHEUS_AUTH_TYPE: public
     ports:
       - "${MINIO_PORT}:${MINIO_PORT}"
       - "${MINIO_CONSOLE_PORT}:${MINIO_CONSOLE_PORT}"
@@ -178,18 +167,12 @@ services:
       KAFKA_MIN_INSYNC_REPLICAS: 1
       KAFKA_LOG_RETENTION_HOURS: 168
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-      # JMX → Prometheus agent on :7071 (broker throughput, replication, controller).
-      KAFKA_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7071:/opt/jmx/kafka.yml"
     volumes:
       - kafka-data:/var/lib/kafka/data
-      - ./downloads/jmx_prometheus_javaagent-0.20.0.jar:/opt/jmx/jmx_prometheus_javaagent.jar:ro
-      - ./prometheus/configs/jmx/kafka.yml:/opt/jmx/kafka.yml:ro
     networks:
       - data-platform
     healthcheck:
-      # Clear KAFKA_OPTS for the check: otherwise the CLI JVM would try to bind the
-      # JMX-exporter agent's :7071 (already held by the broker) and fail.
-      test: ["CMD-SHELL", "KAFKA_OPTS= /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -265,11 +248,6 @@ services:
       CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
-      # JMX → Prometheus agent on :7072 (connector/task health, sink consumer lag).
-      KAFKA_OPTS: "-javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7072:/opt/jmx/connect.yml"
-    volumes:
-      - ./downloads/jmx_prometheus_javaagent-0.20.0.jar:/opt/jmx/jmx_prometheus_javaagent.jar:ro
-      - ./prometheus/configs/jmx/connect.yml:/opt/jmx/connect.yml:ro
     ports:
       - "8083:8083"
     networks:
@@ -316,9 +294,6 @@ services:
       - --conf
       - spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
       - spark-internal
-    volumes:
-      # Native Prometheus metrics on the driver UI (:4040/metrics/prometheus/).
-      - ./spark/configs/metrics.properties:/opt/spark/conf/metrics.properties:ro
     ports:
       - "10000:10000"
       - "4040:4040"
@@ -330,21 +305,6 @@ services:
       timeout: 5s
       retries: 18
       start_period: 30s
-
-  dbt-spark:
-    build: ./dbt-spark
-    container_name: dbt-spark
-    profiles: ["lakehouse"]
-    depends_on:
-      spark:
-        condition: service_healthy
-    environment:
-      SPARK_THRIFT_HOST: spark
-      SPARK_THRIFT_PORT: "10000"
-    volumes:
-      - ../dbt:/usr/app/dbt
-    networks:
-      - data-platform
 
   trino:
     image: trinodb/trino:462
@@ -441,72 +401,3 @@ services:
       timeout: 10s
       retries: 12
       start_period: 45s
-
-  # ---- Observability (profile: obs) ---------------------------------------
-  prometheus:
-    image: prom/prometheus:v2.54.1
-    container_name: prometheus
-    profiles: ["obs"]
-    # Render __MINIO_PORT__ from .env (Compose substitutes ${MINIO_PORT} into the command)
-    # so the MinIO scrape target's port never drifts from the rest of the stack.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        sed "s/__MINIO_PORT__/${MINIO_PORT}/g" /etc/prometheus/prometheus.tmpl.yml > /tmp/prometheus.yml
-        exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=:9090
-    volumes:
-      - ./prometheus/configs/prometheus.yml:/etc/prometheus/prometheus.tmpl.yml:ro
-      - prometheus-data:/prometheus
-    ports:
-      - "9090:9090"
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-
-  grafana:
-    image: grafana/grafana:11.2.0
-    container_name: grafana
-    profiles: ["obs"]
-    depends_on:
-      prometheus:
-        condition: service_healthy
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafana-data:/var/lib/grafana
-    ports:
-      - "${GRAFANA_PORT}:3000"
-    networks:
-      - data-platform
-
-  # Source Postgres exporter — replication-slot lag (CDC health), connections, up.
-  postgres-exporter:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
-    container_name: postgres-exporter
-    profiles: ["obs"]
-    environment:
-      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
-    networks:
-      - data-platform
-
-  # Receives Airflow StatsD (UDP :9125), exposes Prometheus metrics (:9102).
-  statsd-exporter:
-    image: prom/statsd-exporter:v0.27.1
-    container_name: statsd-exporter
-    profiles: ["obs"]
-    command:
-      - "--statsd.mapping-config=/etc/statsd/mapping.yml"
-      - "--statsd.listen-udp=:9125"
-      - "--web.listen-address=:9102"
-    volumes:
-      - ./prometheus/configs/statsd-mapping.yml:/etc/statsd/mapping.yml:ro
-    networks:
-      - data-platform

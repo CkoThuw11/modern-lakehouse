@@ -13,7 +13,7 @@
     <Scope>
         A single-host Docker Compose platform: Postgres CDC → Debezium → Kafka → Kafka Connect
         Iceberg sink (→ bronze, directly) → dbt-on-Spark-Thrift (silver/gold Iceberg tables) →
-        Trino (interactive query), orchestrated by Airflow and observed by Prometheus + Grafana.
+        Trino (interactive query), orchestrated by Airflow.
     </Scope>
     <Actors>
         - The Operator (human): makes design/dataset decisions, verifies acceptance criteria.
@@ -81,7 +81,6 @@
         [ Trino ]  → interactive query over gold
 
         Airflow orchestrates: verify connectors → dbt run → dbt test.
-        Prometheus scrapes all → Grafana dashboards.
     </Data_Flow>
     <Ingestion_Model>
         Debezium emits every change. A Kafka Connect Iceberg sink connector appends events into
@@ -102,7 +101,7 @@
     <Deployment>
         - Orchestration: Docker Compose v2, single host.
         - Every image version PINNED. No `:latest`, ever.
-        - Compose profiles group services: core, streaming, lakehouse, bi, orchestration, obs.
+        - Compose profiles group services: core, streaming, lakehouse, bi, orchestration.
         - All secrets/endpoints via `.env` (referenced in compose). Commit only `.env.example`.
     </Deployment>
     <Infrastructure_Stack>
@@ -123,14 +122,10 @@
         - Transformation: dbt with the `dbt-spark` adapter, `method: thrift`.
         - Query engine: Trino (Iceberg catalog → REST Catalog + MinIO).
     </Lakehouse_Stack>
-    <Serving_Observability_Stack>
+    <Serving_Stack>
         - Orchestration: Airflow (own metadata DB).
         - Serving/query: Trino (interactive SQL over gold). No separate BI tool (Metabase dropped).
-        - Metrics: Prometheus — Kafka + Kafka Connect (JMX exporter agent), Postgres
-          (postgres_exporter), Airflow (StatsD → statsd_exporter), Spark (PrometheusServlet),
-          MinIO (built-in). Curated JMX/StatsD mappings — meaningful metrics, not a firehose.
-        - Dashboards: Grafana on Prometheus, provisioned from files (datasource + dashboards).
-    </Serving_Observability_Stack>
+    </Serving_Stack>
 </Requirements>
 
 <Repository_Structure>
@@ -155,7 +150,6 @@
     │   ├── iceberg-rest/     # CUSTOM: Dockerfile (context: .., COPYs downloads/postgresql.jar)
     │   ├── kafka-connect/    # CUSTOM: Dockerfile (context: ..) + connectors/{debezium-postgres-source.json,iceberg-sink.json}
     │   ├── spark/            # CUSTOM: Dockerfile (context: ..) + configs/spark-defaults.conf
-    │   ├── dbt-spark/        # CUSTOM: Dockerfile + entrypoint.sh, one-shot dbt runner (mounts ../dbt)
     │   └── trino/            # CONFIG ONLY — NO Dockerfile — configs/catalog/iceberg.properties
     ├── dbt/                  # top level — project only, no Dockerfile
     │   ├── dbt_project.yml
@@ -166,9 +160,7 @@
     ```
 
     INLINE-in-compose (no folder): akhq, kafka, schema-registry, minio (+ bucket-init mc container),
-    iceberg-rest-db (catalog backend Postgres), postgres-exporter, statsd-exporter. prometheus and
-    grafana are inline services but mount config from docker/prometheus/ and docker/grafana/
-    (config-only, no Dockerfile — like Trino).
+    iceberg-rest-db (catalog backend Postgres).
 </Repository_Structure>
 
 <Constraints>

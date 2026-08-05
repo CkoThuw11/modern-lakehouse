@@ -154,12 +154,6 @@ fi
 download_file "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.3.4/hadoop-client-api-3.3.4.jar" "iceberg-kafka-connect/hadoop-client-api-3.3.4.jar"
 download_file "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.3.4/hadoop-client-runtime-3.3.4.jar" "iceberg-kafka-connect/hadoop-client-runtime-3.3.4.jar"
 
-# Observability (Prometheus) — JMX exporter Java agent. Mounted (not baked) into the
-# Kafka broker and Kafka Connect worker JVMs to expose their JMX MBeans as Prometheus
-# metrics (broker throughput, connector task counts, sink consumer lag).
-log_info "--- Downloading Observability Dependencies ---"
-download_file "https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/0.20.0/jmx_prometheus_javaagent-0.20.0.jar" "jmx_prometheus_javaagent-0.20.0.jar"
-
 log_success "All dependencies downloaded successfully to $DOWNLOAD_DIR"
 
 # Show summary

@@ -52,7 +52,6 @@ required_files=(
     "iceberg-kafka-connect/iceberg-aws-bundle-1.9.1.jar"
     "iceberg-kafka-connect/hadoop-client-api-3.3.4.jar"
     "iceberg-kafka-connect/hadoop-client-runtime-3.3.4.jar"
-    "jmx_prometheus_javaagent-0.20.0.jar"
 )
 required_dirs=(
     "debezium-debezium-connector-postgresql"
@@ -120,4 +119,4 @@ fi
 
 echo ""
 log_success "✅ Ready for data platform deployment!"
-echo "Run: make up PROFILES=\"core lakehouse streaming\""
+echo "Run: ./start-all.sh"
