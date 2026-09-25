@@ -5,7 +5,7 @@ models:
     description: Revenue and order count per calendar day.
     columns:
       - name: order_date
-        tests:
+        data_tests:
           - not_null
           - unique
 
@@ -13,6 +13,6 @@ models:
     description: Lifetime order count and revenue per customer.
     columns:
       - name: customer_id
-        tests:
+        data_tests:
           - not_null
           - unique

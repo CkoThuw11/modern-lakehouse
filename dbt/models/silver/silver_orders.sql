@@ -1,3 +1,5 @@
+{{ config(unique_key='order_id') }}
+
 WITH parsed AS (
     SELECT
         COALESCE(after.order_id, before.order_id) AS order_id,
@@ -11,7 +13,8 @@ WITH parsed AS (
         op,
         source.lsn AS lsn,
         ts_ms
-    FROM lakehouse.bronze.orders
+    FROM {{ source('bronze', 'orders') }}
+    WHERE {{ cdc_new_events() }}
 ),
 
 ranked AS (
@@ -43,6 +46,8 @@ SELECT
         ELSE DATE_ADD(DATE'1970-01-01', shipped_date)
     END AS shipped_date,
     store_id,
-    staff_id
+    staff_id,
+    ts_ms      AS _cdc_ts_ms,
+    is_deleted AS _is_deleted
 FROM ranked
-WHERE rn = 1 AND NOT is_deleted
+WHERE rn = 1

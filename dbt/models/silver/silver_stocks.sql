@@ -1,3 +1,5 @@
+{{ config(unique_key='store_product_key') }}
+
 WITH parsed AS (
     SELECT
         COALESCE(after.store_id, before.store_id)     AS store_id,
@@ -6,7 +8,8 @@ WITH parsed AS (
         op,
         source.lsn AS lsn,
         ts_ms
-    FROM lakehouse.bronze.stocks
+    FROM {{ source('bronze', 'stocks') }}
+    WHERE {{ cdc_new_events() }}
 ),
 
 ranked AS (
@@ -25,6 +28,8 @@ SELECT
     CONCAT(store_id, '-', product_id) AS store_product_key,
     store_id,
     product_id,
-    quantity
+    quantity,
+    ts_ms      AS _cdc_ts_ms,
+    is_deleted AS _is_deleted
 FROM ranked
-WHERE rn = 1 AND NOT is_deleted
+WHERE rn = 1

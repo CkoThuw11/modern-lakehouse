@@ -65,10 +65,10 @@ Register the connectors once `core` + `streaming` (+ `lakehouse` for the sink) a
 ```bash
 set -a; source ../.env; set +a
 envsubst < kafka-connect/connectors/debezium-postgres-source.json | \
-  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:8083/connectors
-curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["bronze"]}' http://localhost:8181/v1/namespaces
+  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
+curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["bronze"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces
 envsubst < kafka-connect/connectors/iceberg-sink.json | \
-  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:8083/connectors
+  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
 ```
 
 Run dbt directly (needs `lakehouse` + `orchestration` up — this runs it through the Airflow
@@ -109,6 +109,7 @@ Airflow UI: **http://localhost:8088** (`admin`/`admin` by default) — unpause a
 │   ├── build-all-images.sh       # verifies downloads/, then `docker compose build`s every custom image
 │   ├── start-all.sh              # one command: download → build → up → register → dbt (+ reset)
 │   ├── downloads/                # gitignored — jars + confluent-hub plugin dirs
+│   ├── minio/                # CUSTOM: Dockerfile builds minio + mc from source (no public images)
 │   ├── postgres/             # CUSTOM: Dockerfile + configs/{init.sql,postgresql.conf}
 │   ├── iceberg-rest/         # CUSTOM: Dockerfile (context: .., COPYs downloads/postgresql.jar)
 │   ├── kafka-connect/        # CUSTOM: Dockerfile (context: ..) + connectors/

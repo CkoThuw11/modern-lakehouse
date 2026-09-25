@@ -3,6 +3,7 @@ version: '1.0.0'
 config-version: 2
 
 profile: 'data_platform'
+require-dbt-version: [">=1.8.0", "<1.9.0"]
 
 model-paths: ["models"]
 macro-paths: ["macros"]
@@ -18,5 +19,13 @@ models:
     +materialized: table
     silver:
       +schema: lakehouse.silver
+      +materialized: incremental
+      +incremental_strategy: merge
+      +on_schema_change: append_new_columns
+      # merge can't delete: delete events upsert a row flagged _is_deleted, removed here
+      +post-hook: "DELETE FROM {{ this }} WHERE _is_deleted"
     gold:
       +schema: lakehouse.gold
+
+vars:
+  cdc_lookback_ms: 3600000   # 1h re-read window for incremental silver (see macros/cdc_new_events.sql)

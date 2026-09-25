@@ -1,3 +1,5 @@
+{{ config(unique_key='order_item_key') }}
+
 WITH parsed AS (
     SELECT
         COALESCE(after.order_id, before.order_id) AS order_id,
@@ -9,7 +11,8 @@ WITH parsed AS (
         op,
         source.lsn AS lsn,
         ts_ms
-    FROM lakehouse.bronze.order_items
+    FROM {{ source('bronze', 'order_items') }}
+    WHERE {{ cdc_new_events() }}
 ),
 
 ranked AS (
@@ -32,6 +35,8 @@ SELECT
     quantity,
     CAST(list_price AS DECIMAL(10, 2)) AS list_price,
     CAST(discount AS DECIMAL(4, 2)) AS discount,
-    CAST(quantity * list_price * (1 - discount) AS DECIMAL(12, 2)) AS line_revenue
+    CAST(quantity * list_price * (1 - discount) AS DECIMAL(12, 2)) AS line_revenue,
+    ts_ms      AS _cdc_ts_ms,
+    is_deleted AS _is_deleted
 FROM ranked
-WHERE rn = 1 AND NOT is_deleted
+WHERE rn = 1

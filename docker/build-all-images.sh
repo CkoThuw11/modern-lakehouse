@@ -52,9 +52,7 @@ required_files=(
     "iceberg-kafka-connect/iceberg-aws-bundle-1.9.1.jar"
     "iceberg-kafka-connect/hadoop-client-api-3.3.4.jar"
     "iceberg-kafka-connect/hadoop-client-runtime-3.3.4.jar"
-)
-required_dirs=(
-    "debezium-debezium-connector-postgresql"
+    "debezium-connector-postgres-2.5.4.Final-plugin.tar.gz"
 )
 
 log_info "Checking for required download files..."
@@ -62,11 +60,6 @@ missing=()
 for file in "${required_files[@]}"; do
     if [ ! -f "$DOWNLOAD_DIR/$file" ]; then
         missing+=("$file")
-    fi
-done
-for dir in "${required_dirs[@]}"; do
-    if [ ! -d "$DOWNLOAD_DIR/$dir" ]; then
-        missing+=("$dir/")
     fi
 done
 
@@ -98,7 +91,7 @@ build_image() {
 # Track build results
 build_errors=0
 
-for service in postgres iceberg-rest kafka-connect spark; do
+for service in minio postgres iceberg-rest kafka-connect spark; do
     if ! build_image "$service"; then
         ((build_errors++))
     fi
@@ -111,7 +104,7 @@ if [ "$build_errors" -eq 0 ]; then
     echo ""
     log_info "📋 Built images:"
     docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}" \
-      | grep -E "^data-platform-(postgres|iceberg-rest|kafka-connect|spark):" || true
+      | grep -E "^data-platform-(minio|postgres|iceberg-rest|kafka-connect|spark):" || true
 else
     log_error "❌ $build_errors image(s) failed to build"
     exit 1

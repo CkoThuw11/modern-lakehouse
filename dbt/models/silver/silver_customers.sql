@@ -1,3 +1,5 @@
+{{ config(unique_key='customer_id') }}
+
 WITH parsed AS (
     SELECT
         COALESCE(after.customer_id, before.customer_id) AS customer_id,
@@ -12,7 +14,8 @@ WITH parsed AS (
         op,
         source.lsn AS lsn,
         ts_ms
-    FROM lakehouse.bronze.customers
+    FROM {{ source('bronze', 'customers') }}
+    WHERE {{ cdc_new_events() }}
 ),
 
 ranked AS (
@@ -36,6 +39,8 @@ SELECT
     street,
     city,
     state,
-    zip_code
+    zip_code,
+    ts_ms      AS _cdc_ts_ms,
+    is_deleted AS _is_deleted
 FROM ranked
-WHERE rn = 1 AND NOT is_deleted
+WHERE rn = 1

@@ -50,6 +50,7 @@ if [ ! -f ../.env ]; then
     log_info "No ../.env found — creating it from ../.env.example"
     cp ../.env.example ../.env
 fi
+set -a; source ../.env; set +a
 
 # 2. Download dependencies + build every custom image ------------------------
 log_info "Downloading dependencies..."
@@ -63,26 +64,25 @@ log_info "Starting all profiles (${ALL_PROFILES})..."
 
 # 3. Register the Debezium source + Iceberg sink once Kafka Connect is ready -
 wait_for "Kafka Connect REST API" 180 \
-    curl -sf http://localhost:8083/connectors
+    curl -sf http://localhost:${KAFKA_CONNECT_PORT}/connectors
 wait_for "Iceberg sink plugin to load" 180 \
-    bash -c "curl -sf http://localhost:8083/connector-plugins | grep -q IcebergSinkConnector"
+    bash -c "curl -sf http://localhost:${KAFKA_CONNECT_PORT}/connector-plugins | grep -q IcebergSinkConnector"
 
 log_info "Registering Debezium source connector..."
-set -a; source ../.env; set +a
-envsubst '$POSTGRES_PORT $POSTGRES_USER $POSTGRES_PASSWORD $POSTGRES_DB' \
+envsubst '$POSTGRES_USER $POSTGRES_PASSWORD $POSTGRES_DB' \
     < kafka-connect/connectors/debezium-postgres-source.json | \
-    curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:8083/connectors | jq .
+    curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors | jq .
 
 log_info "Registering Iceberg sink connector..."
 curl -s -X POST -H "Content-Type: application/json" \
-    --data '{"namespace": ["bronze"]}' http://localhost:8181/v1/namespaces > /dev/null
-envsubst '$MINIO_PORT $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD' \
+    --data '{"namespace": ["bronze"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces > /dev/null
+envsubst '$MINIO_ROOT_USER $MINIO_ROOT_PASSWORD' \
     < kafka-connect/connectors/iceberg-sink.json | \
-    curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:8083/connectors | jq .
+    curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors | jq .
 
 # 4. Wait for the sink's first commit to auto-create all four bronze tables --
 wait_for "all four bronze tables to materialize" 300 \
-    bash -c '[ "$(curl -sf http://localhost:8181/v1/namespaces/bronze/tables | jq -r ".identifiers | length")" -ge 4 ]'
+    bash -c '[ "$(curl -sf http://localhost:${ICEBERG_REST_PORT}/v1/namespaces/bronze/tables | jq -r ".identifiers | length")" -ge 4 ]'
 
 # 5. Transform: bronze -> silver -> gold, then assert ------------------------
 # Runs through the Airflow image's own dbt venv (/opt/dbt-venv), the same one the
@@ -98,10 +98,10 @@ log_info "Running dbt tests..."
 log_success "Platform is up end-to-end."
 echo ""
 log_info "Endpoints:"
-echo "  - MinIO console     http://localhost:9001"
-echo "  - AKHQ (Kafka UI)   http://localhost:8080"
-echo "  - Kafka Connect     http://localhost:8083"
-echo "  - Iceberg REST      http://localhost:8181"
-echo "  - Spark Thrift      localhost:10000 (beeline/JDBC)"
-echo "  - Trino             http://localhost:8085"
-echo "  - Airflow           http://localhost:8088"
+echo "  - MinIO console     http://localhost:${MINIO_CONSOLE_PORT}"
+echo "  - AKHQ (Kafka UI)   http://localhost:${AKHQ_PORT}"
+echo "  - Kafka Connect     http://localhost:${KAFKA_CONNECT_PORT}"
+echo "  - Iceberg REST      http://localhost:${ICEBERG_REST_PORT}"
+echo "  - Spark Thrift      localhost:${SPARK_THRIFT_PORT} (beeline/JDBC)"
+echo "  - Trino             http://localhost:${TRINO_PORT}"
+echo "  - Airflow           http://localhost:${AIRFLOW_WEBSERVER_PORT}"

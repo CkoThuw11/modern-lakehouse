@@ -17,7 +17,7 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: airflow/Dockerfile
-  image: data-platform-airflow:latest
+  image: data-platform-airflow:2.10.4
   profiles: ["orchestration"]
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -39,16 +39,17 @@ x-airflow-common: &airflow-common
 
 services:
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    build: ./minio
+    image: data-platform-minio:RELEASE.2025-10-15T17-29-55Z
     container_name: minio
     profiles: ["core", "lakehouse"]
-    command: server /data --address ":${MINIO_PORT}" --console-address ":${MINIO_CONSOLE_PORT}"
+    command: server /data --address ":9000" --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "${MINIO_PORT}:${MINIO_PORT}"
-      - "${MINIO_CONSOLE_PORT}:${MINIO_CONSOLE_PORT}"
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
     volumes:
       - minio-data:/data
     networks:
@@ -60,7 +61,8 @@ services:
       retries: 12
 
   minio-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    build: ./minio
+    image: data-platform-minio:RELEASE.2025-10-15T17-29-55Z
     container_name: minio-init
     profiles: ["core", "lakehouse"]
     depends_on:
@@ -70,12 +72,12 @@ services:
       - data-platform
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:${MINIO_PORT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
       mc mb --ignore-existing local/lakehouse
       "
 
   iceberg-rest-db:
-    image: postgres:15
+    image: postgres:15.19
     container_name: iceberg-rest-db
     profiles: ["lakehouse"]
     environment:
@@ -110,13 +112,13 @@ services:
       CATALOG_JDBC_PASSWORD: ${ICEBERG_REST_DB_PASSWORD}
       CATALOG_WAREHOUSE: s3://lakehouse/warehouse
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:${MINIO_PORT}
+      CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
       CATALOG_S3_ACCESS__KEY__ID: ${MINIO_ROOT_USER}
       CATALOG_S3_SECRET__ACCESS__KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
     ports:
-      - "8181:8181"
+      - "${ICEBERG_REST_PORT}:8181"
     networks:
       - data-platform
     healthcheck:
@@ -150,12 +152,12 @@ services:
     container_name: kafka
     profiles: ["streaming"]
     ports:
-      - "9094:9094"
+      - "${KAFKA_PORT}:9094"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_PORT}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
@@ -189,7 +191,7 @@ services:
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
     ports:
-      - "8081:8081"
+      - "${SCHEMA_REGISTRY_PORT}:8081"
     networks:
       - data-platform
     healthcheck:
@@ -217,7 +219,7 @@ services:
               schema-registry:
                 url: "http://schema-registry:8081"
     ports:
-      - "8080:8080"
+      - "${AKHQ_PORT}:8080"
     networks:
       - data-platform
 
@@ -243,13 +245,17 @@ services:
       CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
       CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
       CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
-      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      # The Iceberg sink only reads its control topic inside put(), which an idle sink
+      # task gets once per flush interval (default 60s) -- too rare for its control
+      # consumer to join its group, so commits time out with 0 tables committed.
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 5000
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
     ports:
-      - "8083:8083"
+      - "${KAFKA_CONNECT_PORT}:8083"
     networks:
       - data-platform
     healthcheck:
@@ -281,22 +287,15 @@ services:
       - spark.hive.server2.thrift.port=10000
       - --conf
       - spark.hive.server2.thrift.bind.host=0.0.0.0
-      - --conf
-      - spark.sql.catalog.lakehouse.s3.endpoint=http://minio:${MINIO_PORT}
-      - --conf
-      - spark.sql.catalog.lakehouse.s3.access-key-id=${MINIO_ROOT_USER}
-      - --conf
-      - spark.sql.catalog.lakehouse.s3.secret-access-key=${MINIO_ROOT_PASSWORD}
-      - --conf
-      - spark.hadoop.fs.s3a.endpoint=http://minio:${MINIO_PORT}
-      - --conf
-      - spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER}
-      - --conf
-      - spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
       - spark-internal
+    # MinIO credentials via the standard AWS env vars (picked up by both Iceberg
+    # S3FileIO and Hadoop S3A), so they never appear in the process command line.
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "10000:10000"
-      - "4040:4040"
+      - "${SPARK_THRIFT_PORT}:10000"
+      - "${SPARK_UI_PORT}:4040"
     networks:
       - data-platform
     healthcheck:
@@ -318,7 +317,6 @@ services:
     environment:
       # Consumed by trino/configs/catalog/iceberg.properties via ${ENV:...} substitution,
       # keeping MinIO/S3 settings identical to the REST Catalog / Spark / Kafka Connect.
-      MINIO_PORT: ${MINIO_PORT}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     # Config only — no Dockerfile. Mount just the Iceberg catalog; the image's built-in
@@ -326,7 +324,7 @@ services:
     volumes:
       - ./trino/configs/catalog:/etc/trino/catalog:ro
     ports:
-      - "8085:8080"
+      - "${TRINO_PORT}:8080"
     networks:
       - data-platform
     healthcheck:
@@ -337,7 +335,7 @@ services:
       start_period: 30s
 
   airflow-db:
-    image: postgres:15
+    image: postgres:15.19
     container_name: airflow-db
     profiles: ["orchestration"]
     environment:

@@ -11,7 +11,6 @@ mkdir -p "$DOWNLOAD_DIR"
 # Colors for output
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 log_info() {
@@ -20,10 +19,6 @@ log_info() {
 
 log_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
 usage() {
@@ -78,24 +73,6 @@ download_file() {
     fi
 }
 
-install_connect_plugin() {
-    local plugin=$1
-    local dirname=$2
-
-    if [ -d "$DOWNLOAD_DIR/$dirname" ]; then
-        log_info "Plugin already installed: $dirname"
-    else
-        log_info "Installing Kafka Connect plugin: $plugin"
-        # confluent-hub runs as a container user that doesn't own $DOWNLOAD_DIR on
-        # the host, so it needs the mount to be world-writable.
-        chmod 777 "$DOWNLOAD_DIR"
-        docker run --rm -v "$DOWNLOAD_DIR:/downloads" \
-            --entrypoint confluent-hub confluentinc/cp-kafka-connect:7.6.1 \
-            install --no-prompt --component-dir /downloads --worker-configs "" "$plugin"
-        log_success "Installed: $plugin"
-    fi
-}
-
 # Iceberg REST Catalog Dependencies
 log_info "--- Downloading Iceberg REST Catalog Dependencies ---"
 download_file "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar" "postgresql.jar"
@@ -108,51 +85,74 @@ download_file "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4
 download_file "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"
 
 # Kafka Connect Dependencies (Debezium Postgres source, Iceberg sink)
-log_info "--- Installing Kafka Connect Plugins ---"
-install_connect_plugin "debezium/debezium-connector-postgresql:2.5.4-2" "debezium-debezium-connector-postgresql"
+log_info "--- Downloading Kafka Connect Plugins ---"
+download_file "https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.5.4.Final/debezium-connector-postgres-2.5.4.Final-plugin.tar.gz"
 
-# Apache-native Iceberg Kafka Connect sink. The databricks fork froze at 0.6.19 (open multi-table
-# routing bug apache/iceberg#13457) and Apache publishes no ready-to-use plugin zip, so we assemble
-# the plugin from the connector's exact Maven RUNTIME closure: the standalone, NON-shaded iceberg
-# jars plus plain Avro/Parquet. (The shaded iceberg-spark-runtime fat jar returns shaded Avro types
-# from AvroSchemaUtil and is binary-incompatible with the connector's event classes — it fails at
-# commit time with NoSuchMethodError.) iceberg-parquet/iceberg-orc are optional deps of iceberg-data
-# so they're requested explicitly; the AWS SDK bundle (S3FileIO) and Hadoop's shaded client (the
-# Parquet writer's org.apache.hadoop.conf.Configuration, which Spark provides at runtime but a Kafka
-# Connect worker does not) are added on top.
-ICEBERG_CONNECT_DIR="$DOWNLOAD_DIR/iceberg-kafka-connect"
-if [ -f "$ICEBERG_CONNECT_DIR/iceberg-kafka-connect-1.9.1.jar" ]; then
-    log_info "Plugin already assembled: iceberg-kafka-connect"
-else
-    log_info "Resolving Apache Iceberg Kafka Connect runtime closure via Maven..."
-    mkdir -p "$ICEBERG_CONNECT_DIR"
-    chmod 777 "$ICEBERG_CONNECT_DIR"
-    pomdir="$(mktemp -d)"
-    cat > "$pomdir/pom.xml" <<'POM'
-<project xmlns="http://maven.apache.org/POM/4.0.0">
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>data-platform</groupId>
-  <artifactId>iceberg-kafka-connect-deps</artifactId>
-  <version>1</version>
-  <packaging>pom</packaging>
-  <dependencies>
-    <dependency><groupId>org.apache.iceberg</groupId><artifactId>iceberg-kafka-connect</artifactId><version>1.9.1</version></dependency>
-    <dependency><groupId>org.apache.iceberg</groupId><artifactId>iceberg-kafka-connect-events</artifactId><version>1.9.1</version></dependency>
-    <dependency><groupId>org.apache.iceberg</groupId><artifactId>iceberg-aws</artifactId><version>1.9.1</version></dependency>
-    <dependency><groupId>org.apache.iceberg</groupId><artifactId>iceberg-parquet</artifactId><version>1.9.1</version></dependency>
-    <dependency><groupId>org.apache.iceberg</groupId><artifactId>iceberg-orc</artifactId><version>1.9.1</version></dependency>
-  </dependencies>
-</project>
-POM
-    docker run --rm -v "$pomdir:/w" -v "$ICEBERG_CONNECT_DIR:/out" -w /w maven:3.9-eclipse-temurin-17 \
-        mvn -q -B dependency:copy-dependencies -DincludeScope=runtime -DexcludeScope=provided -DoutputDirectory=/out
-    rm -rf "$pomdir"
-    # AWS SDK v2 bundle for S3FileIO (iceberg-aws classes come from the closure; the SDK does not).
-    cp "$DOWNLOAD_DIR/iceberg-aws-bundle-1.9.1.jar" "$ICEBERG_CONNECT_DIR/"
-    log_success "Assembled iceberg-kafka-connect plugin ($(ls -1 "$ICEBERG_CONNECT_DIR"/*.jar | wc -l) jars)"
-fi
-download_file "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.3.4/hadoop-client-api-3.3.4.jar" "iceberg-kafka-connect/hadoop-client-api-3.3.4.jar"
-download_file "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.3.4/hadoop-client-runtime-3.3.4.jar" "iceberg-kafka-connect/hadoop-client-runtime-3.3.4.jar"
+# Iceberg sink: Apache publishes no runtime bundle, so every jar the connector needs
+# is listed here (the runtime deps of iceberg-kafka-connect 1.9.1). Do not swap in the
+# Spark runtime fat jar: it relocates Avro, which breaks the commit coordinator
+# (NoSuchMethodError in StartCommit). Keep versions in step with Iceberg 1.9.1.
+SINK_DIR="iceberg-kafka-connect"
+mkdir -p "$DOWNLOAD_DIR/$SINK_DIR"
+download_sink_jar() {
+    download_file "$1" "$SINK_DIR/$(basename "$1")"
+}
+
+# Iceberg connector + core
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-api/1.9.1/iceberg-api-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-bundled-guava/1.9.1/iceberg-bundled-guava-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-common/1.9.1/iceberg-common-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-core/1.9.1/iceberg-core-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-data/1.9.1/iceberg-data-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-kafka-connect-events/1.9.1/iceberg-kafka-connect-events-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-kafka-connect/1.9.1/iceberg-kafka-connect-1.9.1.jar"
+
+# File formats (Parquet, ORC, Avro) + compression
+download_sink_jar "https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.6-6/zstd-jni-1.5.6-6.jar"
+download_sink_jar "https://repo1.maven.org/maven2/io/airlift/aircompressor/0.27/aircompressor-0.27.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/avro/avro/1.12.0/avro-1.12.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/commons/commons-compress/1.26.2/commons-compress-1.26.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-orc/1.9.1/iceberg-orc-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-parquet/1.9.1/iceberg-parquet-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/orc/orc-core/1.9.5/orc-core-1.9.5-nohive.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/orc/orc-shims/1.9.5/orc-shims-1.9.5.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-avro/1.15.2/parquet-avro-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-column/1.15.2/parquet-column-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-common/1.15.2/parquet-common-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-encoding/1.15.2/parquet-encoding-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-format-structures/1.15.2/parquet-format-structures-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-hadoop/1.15.2/parquet-hadoop-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/parquet/parquet-jackson/1.15.2/parquet-jackson-1.15.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/roaringbitmap/RoaringBitmap/1.3.0/RoaringBitmap-1.3.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/threeten/threeten-extra/1.7.1/threeten-extra-1.7.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/xerial/snappy/snappy-java/1.1.10.7/snappy-java-1.1.10.7.jar"
+
+# S3FileIO (MinIO)
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.9.1/iceberg-aws-bundle-1.9.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws/1.9.1/iceberg-aws-1.9.1.jar"
+
+# Hadoop Configuration classes the sink references
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-api/3.3.4/hadoop-client-api-3.3.4.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-client-runtime/3.3.4/hadoop-client-runtime-3.3.4.jar"
+
+# Shared transitive libraries
+download_sink_jar "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-annotations/2.18.3/jackson-annotations-2.18.3.jar"
+download_sink_jar "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-core/2.18.3/jackson-core-2.18.3.jar"
+download_sink_jar "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.18.3/jackson-databind-2.18.3.jar"
+download_sink_jar "https://repo1.maven.org/maven2/com/github/ben-manes/caffeine/caffeine/2.9.3/caffeine-2.9.3.jar"
+download_sink_jar "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.10.0/error_prone_annotations-2.10.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/commons-codec/commons-codec/1.17.0/commons-codec-1.17.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/commons-io/commons-io/2.16.1/commons-io-2.16.1.jar"
+download_sink_jar "https://repo1.maven.org/maven2/commons-pool/commons-pool/1.6/commons-pool-1.6.jar"
+download_sink_jar "https://repo1.maven.org/maven2/dev/failsafe/failsafe/3.3.2/failsafe-3.3.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/javax/annotation/javax.annotation-api/1.3.2/javax.annotation-api-1.3.2.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/httpcomponents/client5/httpclient5/5.4.3/httpclient5-5.4.3.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/httpcomponents/core5/httpcore5-h2/5.3.4/httpcore5-h2-5.3.4.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/apache/httpcomponents/core5/httpcore5/5.3.4/httpcore5-5.3.4.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/checkerframework/checker-qual/3.19.0/checker-qual-3.19.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/jetbrains/annotations/17.0.0/annotations-17.0.0.jar"
+download_sink_jar "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17.jar"
 
 log_success "All dependencies downloaded successfully to $DOWNLOAD_DIR"
 

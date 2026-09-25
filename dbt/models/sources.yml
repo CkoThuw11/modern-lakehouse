@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: Raw Debezium CDC events, one row per event, written by the Kafka Connect Iceberg sink (not dbt-managed).
+    schema: lakehouse.bronze
+    # ts_ms = when Debezium processed the event. With no source activity bronze looks
+    # stale even when the pipeline is healthy, so this only warns.
+    loaded_at_field: "timestamp_millis(ts_ms)"
+    freshness:
+      warn_after: {count: 24, period: hour}
+    tables:
+      - name: customers
+      - name: orders
+      - name: order_items
+      - name: stocks

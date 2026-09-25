@@ -1,4 +1,4 @@
 FROM confluentinc/cp-kafka-connect:7.6.1
 
-COPY downloads/debezium-debezium-connector-postgresql /usr/share/confluent-hub-components/debezium-debezium-connector-postgresql
+ADD downloads/debezium-connector-postgres-2.5.4.Final-plugin.tar.gz /usr/share/confluent-hub-components/
 COPY downloads/iceberg-kafka-connect /usr/share/confluent-hub-components/iceberg-kafka-connect

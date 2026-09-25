@@ -5,30 +5,50 @@ models:
     description: Active (non-deleted) customers, typed and conformed.
     columns:
       - name: customer_id
-        tests:
+        data_tests:
           - not_null
           - unique
+      - name: _is_deleted
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
 
   - name: silver_orders
     description: Active (non-deleted) orders, typed and conformed.
     columns:
       - name: order_id
-        tests:
+        data_tests:
           - not_null
           - unique
+      - name: _is_deleted
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
 
   - name: silver_order_items
     description: Active (non-deleted) order line items, typed and conformed.
     columns:
       - name: order_item_key
-        tests:
+        data_tests:
           - not_null
           - unique
+      - name: _is_deleted
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
 
   - name: silver_stocks
     description: Active (non-deleted) store/product stock levels, typed and conformed.
     columns:
       - name: store_product_key
-        tests:
+        data_tests:
           - not_null
           - unique
+      - name: _is_deleted
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
