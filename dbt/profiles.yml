@@ -6,7 +6,7 @@ data_platform:
       method: thrift
       host: "{{ env_var('SPARK_THRIFT_HOST', 'localhost') }}"
       port: "{{ env_var('SPARK_THRIFT_PORT', '10000') | int }}"
-      schema: lakehouse.silver
+      schema: silver
       threads: 2
       connect_retries: 5
       connect_timeout: 10

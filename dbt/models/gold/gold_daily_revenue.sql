@@ -1,3 +1,9 @@
+{{ config(
+    materialized='table',
+    file_format='iceberg',
+    schema='gold'
+) }}
+
 SELECT
     o.order_date,
     COUNT(DISTINCT o.order_id) AS order_count,

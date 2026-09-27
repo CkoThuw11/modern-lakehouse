@@ -1,4 +1,12 @@
-{{ config(unique_key='customer_id') }}
+{{ config(
+    materialized='incremental',
+    file_format='iceberg',
+    schema='silver',
+    incremental_strategy='merge',
+    unique_key='customer_id',
+    on_schema_change='append_new_columns',
+    post_hook="DELETE FROM {{ this }} WHERE _is_deleted"
+) }}
 
 WITH parsed AS (
     SELECT
@@ -14,8 +22,12 @@ WITH parsed AS (
         op,
         source.lsn AS lsn,
         ts_ms
-    FROM {{ source('bronze', 'customers') }}
-    WHERE {{ cdc_new_events() }}
+    FROM lakehouse.bronze.customers
+    {% if is_incremental() %}
+    -- Only events newer than silver's watermark, minus a lookback for late bronze
+    -- commits. ts_ms (arrival order), not LSN: a lower LSN can arrive after a higher one.
+    WHERE ts_ms > (SELECT COALESCE(MAX(_cdc_ts_ms), 0) FROM {{ this }}) - {{ var('cdc_lookback_ms') }}
+    {% endif %}
 ),
 
 ranked AS (

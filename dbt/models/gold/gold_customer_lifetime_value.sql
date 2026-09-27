@@ -1,3 +1,9 @@
+{{ config(
+    materialized='table',
+    file_format='iceberg',
+    schema='gold'
+) }}
+
 SELECT
     c.customer_id,
     c.first_name,

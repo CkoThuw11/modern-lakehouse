@@ -74,8 +74,12 @@ envsubst '$POSTGRES_USER $POSTGRES_PASSWORD $POSTGRES_DB' \
     curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors | jq .
 
 log_info "Registering Iceberg sink connector..."
-curl -s -X POST -H "Content-Type: application/json" \
-    --data '{"namespace": ["bronze"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces > /dev/null
+# bronze: sink target. default: Spark's default catalog is lakehouse, and every Thrift
+# session (dbt) opens with `USE default`.
+for ns in bronze default; do
+    curl -s -X POST -H "Content-Type: application/json" \
+        --data "{\"namespace\": [\"$ns\"]}" http://localhost:${ICEBERG_REST_PORT}/v1/namespaces > /dev/null
+done
 envsubst '$MINIO_ROOT_USER $MINIO_ROOT_PASSWORD' \
     < kafka-connect/connectors/iceberg-sink.json | \
     curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors | jq .

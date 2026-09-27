@@ -23,7 +23,7 @@ image — no Docker socket, no separate dbt service in the orchestration path.
 | Streaming | `kafka`, `schema-registry`, `akhq`, `kafka-connect` | Debezium source + Iceberg sink connectors | 8080 (AKHQ), 8083 (Connect) |
 | Lakehouse | `minio`, `iceberg-rest`(+db), `spark` | Object store, REST Catalog, Spark Thrift | 9001 (MinIO), 10000 (Thrift) |
 | BI | `trino` | Interactive SQL over bronze/silver/gold | 8085 |
-| Orchestration | `airflow-*` | `lakehouse_pipeline` DAG: connector checks → dbt run → dbt test (dbt runs from the Airflow image's own venv) | 8088 |
+| Orchestration | `airflow-*` | `lakehouse_pipeline` DAG: wait for Spark Thrift → dbt run → dbt test (dbt runs from the Airflow image's own venv) | 8088 |
 
 ## 🚀 Quickstart
 
@@ -67,6 +67,7 @@ set -a; source ../.env; set +a
 envsubst < kafka-connect/connectors/debezium-postgres-source.json | \
   curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
 curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["bronze"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces
+curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["default"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces
 envsubst < kafka-connect/connectors/iceberg-sink.json | \
   curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
 ```
@@ -124,9 +125,7 @@ Airflow UI: **http://localhost:8088** (`admin`/`admin` by default) — unpause a
 │   └── models/{silver,gold}/  # *.sql + schema.yml (not_null/unique tests) — bronze is Kafka-Connect-managed
 └── airflow/                   # top level — dags/ (bind-mounted into the Airflow image)
     └── dags/
-        ├── pipeline_dag.py            # lakehouse_pipeline: readiness gates → dbt run → dbt test
-        └── operators/                 # reusable custom operators
-            └── dbt_spark_operator.py  # DbtSparkConfig + DbtSpark{Run,Test,Debug,…}Operator
+        └── pipeline_dag.py            # lakehouse_pipeline: wait for Spark Thrift → dbt run → dbt test
 ```
 
 ## ✅ Prerequisites
