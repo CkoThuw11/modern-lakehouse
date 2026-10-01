@@ -1,136 +1,77 @@
 # 🏞️ Data Platform
 
-A local CDC → lakehouse platform, built with Docker Compose. Postgres row changes are streamed
-via Debezium into Kafka, sunk directly into Iceberg `bronze` tables by a Kafka Connect Iceberg
-sink (no intermediate file landing zone), transformed with dbt running on a Spark Thrift server
-into `silver`/`gold` Iceberg tables, queried through Trino, and orchestrated by Airflow.
+A local CDC → lakehouse platform on Docker Compose. Postgres changes are captured by Debezium,
+streamed through Kafka, landed in Apache Iceberg by a Kafka Connect sink, transformed with dbt on
+Spark, queried with Trino, and orchestrated by Airflow.
 
 ## 🏗️ Architecture
 
 ![Lakehouse architecture](Lakehouse_architecture.png)
 
-**Layering:** **bronze** (raw CDC event log, Iceberg, Kafka-Connect-managed — one row per CDC
-event, no dedup) → **silver** (dedup + cleaned + typed, dbt-managed) → **gold** (business marts,
-dbt-managed). Airflow's DAG mounts the top-level `dbt/` project straight into its containers and
-runs it against the Spark Thrift server via a dedicated dbt virtualenv baked into the Airflow
-image — no Docker socket, no separate dbt service in the orchestration path.
 
-## 🧩 Services
 
-| Layer | Service | Purpose | Host port |
-|---|---|---|---|
-| Source | `postgres` | BikeStores OLTP DB, `wal_level=logical` | 5432 |
-| Streaming | `kafka`, `schema-registry`, `akhq`, `kafka-connect` | Debezium source + Iceberg sink connectors | 8080 (AKHQ), 8083 (Connect) |
-| Lakehouse | `minio`, `iceberg-rest`(+db), `spark` | Object store, REST Catalog, Spark Thrift | 9001 (MinIO), 10000 (Thrift) |
-| BI | `trino` | Interactive SQL over bronze/silver/gold | 8085 |
-| Orchestration | `airflow-*` | `lakehouse_pipeline` DAG: wait for Spark Thrift → dbt run → dbt test (dbt runs from the Airflow image's own venv) | 8088 |
+| Layer | Content | Managed by |
+|---|---|---|
+| **bronze** | Raw CDC event log: one row per change (`r`/`c`/`u`/`d`), never updated | Kafka Connect Iceberg sink, commits every 15 s |
+| **silver** | Current state per key: latest event wins, deletes removed (incremental merge) | dbt |
+| **gold** | Business marts: `gold_daily_revenue`, `gold_customer_lifetime_value` | dbt |
 
-## 🚀 Quickstart
+## 🧩 Components
 
-```bash
-cd docker
-./start-all.sh
-```
+| Component | Role |
+|---|---|
+| PostgreSQL | Source OLTP database (BikeStores), `wal_level=logical` |
+| Debezium Postgres connector | Captures row changes from the WAL |
+| Apache Kafka (KRaft) | Event streaming, one topic per table |
+| Schema Registry / Kafka Connect | Avro schemas / runs the source and sink connectors |
+| AKHQ | Kafka UI |
+| Apache Iceberg (sink, Spark runtime, REST catalog) | Table format and catalog for all layers |
+| MinIO | S3-compatible object store (built from source) |
+| Apache Spark (Thrift server) | SQL engine for dbt |
+| dbt-core / dbt-spark | silver and gold transformations + tests |
+| Trino | Interactive SQL over all layers |
+| Apache Airflow | Orchestrates dbt (`lakehouse_pipeline` DAG) |
 
-- `start-all.sh` does everything, in order: creates `../.env` from `.env.example` if missing →
-- `./download-dependencies.sh` (fetches every jar/plugin the custom images need) →
-- `./build-all-images.sh` → brings up every service across every profile → registers the Debezium
-source and Iceberg sink connectors → waits for the sink's first commit to create the `bronze`
-tables → runs `dbt run` + `dbt test`. It's idempotent — re-running reuses the existing `.env`,
-downloads, and connectors. When it finishes it prints every service endpoint.
-
-To tear everything down and wipe all containers + volumes:
-
-```bash
-./start-all.sh reset
-```
-
-## 🧱 Running layers in isolation
-
-Bring up a subset of the stack directly with Docker Compose profiles (`core`, `streaming`,
-`lakehouse`, `bi`, `orchestration`) instead of the full `start-all.sh` run:
-
-```bash
-cd docker
-cp ../.env.example ../.env               # first time only
-./download-dependencies.sh && ./build-all-images.sh
-docker compose --env-file ../.env --profile core --profile lakehouse --profile streaming up -d
-docker compose --env-file ../.env ps
-docker compose --env-file ../.env --profile '*' down       # stop everything
-docker compose --env-file ../.env --profile '*' down -v    # stop + wipe volumes
-```
-
-Register the connectors once `core` + `streaming` (+ `lakehouse` for the sink) are up:
-
-```bash
-set -a; source ../.env; set +a
-envsubst < kafka-connect/connectors/debezium-postgres-source.json | \
-  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
-curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["bronze"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces
-curl -s -X POST -H "Content-Type: application/json" --data '{"namespace": ["default"]}' http://localhost:${ICEBERG_REST_PORT}/v1/namespaces
-envsubst < kafka-connect/connectors/iceberg-sink.json | \
-  curl -s -X POST -H "Content-Type: application/json" --data @- http://localhost:${KAFKA_CONNECT_PORT}/connectors
-```
-
-Run dbt directly (needs `lakehouse` + `orchestration` up — this runs it through the Airflow
-image's own dbt venv, the same one the DAG uses):
-
-```bash
-DBT="/opt/dbt-venv/bin/dbt --profiles-dir /opt/airflow/dbt --project-dir /opt/airflow/dbt"
-docker compose --env-file ../.env run --rm --no-deps -e DBT_TARGET_PATH=/tmp/dbt-target -e DBT_LOG_PATH=/tmp/dbt-logs airflow-scheduler $DBT run
-docker compose --env-file ../.env run --rm --no-deps -e DBT_TARGET_PATH=/tmp/dbt-target -e DBT_LOG_PATH=/tmp/dbt-logs airflow-scheduler $DBT test
-```
-
-Query gold with Trino:
-
-```bash
-docker exec -it trino trino
-```
-```sql
-SHOW SCHEMAS FROM iceberg;                                   -- bronze, silver, gold
-SELECT * FROM iceberg.gold.gold_daily_revenue ORDER BY 1 DESC LIMIT 10;
-```
-
-Airflow UI: **http://localhost:8088** (`admin`/`admin` by default) — unpause and trigger
-`lakehouse_pipeline`.
-
+Services are grouped into Compose profiles (`core`, `streaming`, `lakehouse`, `bi`, `orchestration`)
+so each layer can run on its own. A Python **data generator** (`docker/data-generator/`) simulates
+shop activity on the source to keep CDC flowing.
 
 ## 📂 Repository structure
 
 ```
 .
 ├── README.md
-├── project_plan.md          # phase-by-phase plan
-├── AGENTS.md                # guidelines this build follows
-├── .env.example
-├── bike-store-data/         # original SQL Server source scripts (reference only)
+├── CLAUDE.md                   # guidelines this build follows
+├── .env.example                # credentials + host ports
+├── Lakehouse_architecture.png
 ├── docker/
-│   ├── docker-compose.yaml
-│   ├── download-dependencies.sh  # fetches every jar/plugin into downloads/ (gitignored)
-│   ├── build-all-images.sh       # verifies downloads/, then `docker compose build`s every custom image
-│   ├── start-all.sh              # one command: download → build → up → register → dbt (+ reset)
-│   ├── downloads/                # gitignored — jars + confluent-hub plugin dirs
-│   ├── minio/                # CUSTOM: Dockerfile builds minio + mc from source (no public images)
-│   ├── postgres/             # CUSTOM: Dockerfile + configs/{init.sql,postgresql.conf}
-│   ├── iceberg-rest/         # CUSTOM: Dockerfile (context: .., COPYs downloads/postgresql.jar)
-│   ├── kafka-connect/        # CUSTOM: Dockerfile (context: ..) + connectors/
-│   │   └── connectors/{debezium-postgres-source,iceberg-sink}.json
-│   ├── spark/                # CUSTOM: Dockerfile (context: ..) + configs/spark-defaults.properties
-│   ├── airflow/              # CUSTOM: Dockerfile (apache/airflow + dbt in /opt/dbt-venv, runs the DAG's dbt tasks)
-│   └── trino/                # CONFIG ONLY — configs/catalog/iceberg.properties
-├── dbt/                       # top level — project only, no Dockerfile here
+│   ├── docker-compose.yaml     # all services, grouped by profile
+│   ├── start-all.sh            # one command: download → build → up → register → dbt (+ reset)
+│   ├── download-dependencies.sh
+│   ├── build-all-images.sh
+│   ├── postgres/               # source DB: init.sql, postgresql.conf
+│   ├── kafka-connect/          # Debezium + Iceberg sink plugins, connectors/*.json
+│   ├── minio/                  # builds minio + mc from source
+│   ├── iceberg-rest/           # REST catalog + Postgres JDBC driver
+│   ├── spark/                  # Iceberg/S3 jars, spark-defaults.conf
+│   ├── trino/                  # catalog config only (no Dockerfile)
+│   ├── airflow/                # Airflow image with dbt in /opt/dbt-venv
+│   └── data-generator/         # Python simulator for source changes
+├── dbt/
 │   ├── dbt_project.yml
-│   ├── profiles.yml           # spark adapter, method: thrift, no secrets
-│   ├── macros/generate_schema_name.sql
-│   └── models/{silver,gold}/  # *.sql + schema.yml (not_null/unique tests) — bronze is Kafka-Connect-managed
-└── airflow/                   # top level — dags/ (bind-mounted into the Airflow image)
-    └── dags/
-        └── pipeline_dag.py            # lakehouse_pipeline: wait for Spark Thrift → dbt run → dbt test
+│   ├── profiles.yml            # spark adapter, thrift method
+│   ├── macros/                 # generate_schema_name
+│   └── models/                 # silver/ (incremental), gold/ (tables)
+├── airflow/
+│   └── dags/                   # pipeline_dag.py: wait for Spark → dbt run → dbt test
+└── docs/
+    ├── QUICK-START.md
+    ├── TROUBLESHOOTING.md
+    └── OPERATIONS.md
 ```
 
-## ✅ Prerequisites
+## 📚 Docs
 
-- Docker + Docker Compose v2
-- 32 GB RAM recommended (16 GB is a painful floor); 40 GB+ free disk
-- Compose **profiles** (`core`, `streaming`, `lakehouse`, `bi`, `orchestration`) let you bring up
-  one layer at a time instead of all containers at once
+- [Quick start](docs/QUICK-START.md) — spin up the platform, UIs, example queries
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — common issues and the commands to check them
+- [Operations](docs/OPERATIONS.md) — Iceberg maintenance, schema evolution, future improvements
