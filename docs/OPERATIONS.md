@@ -21,18 +21,17 @@ The sink commits every 15 s, so bronze collects small files and snapshots fastes
 ## 2. Schema Evolution Matrix
 
 Changes made **in Postgres**, carried Debezium → Schema Registry (`BACKWARD` compatibility) →
-bronze (`evolve-schema-enabled`) → silver. Nullable columns are optional Avro fields (default
-`null`); `NOT NULL` columns are required fields without a default.
+bronze (`evolve-schema-enabled`) → silver.
 
-| Change Type | Supported? | Notes |
-|-------------|-----------|-------|
-| Add nullable column | ✅ | Bronze adds the field. Silver selects explicit columns: add it to the model, then `dbt run --full-refresh --select silver+` |
-| Drop column | ✅ | Bronze keeps it (`NULL` for new events). Remove it from the silver model |
-| Rename nullable column | ⚠️ | Seen as drop + add: the old column stops filling. Update the silver model |
-| Rename or add `NOT NULL` column | 🚫 | Required field without a default is not `BACKWARD`-compatible → Debezium task fails |
-| Widen type (`int` → `bigint`) | ✅ | Avro `int` → `long` promotion is compatible |
-| Incompatible type (`int` → `text`) | 🚫 | Not an Avro promotion → Debezium task fails |
-| `ADD COLUMN ... DEFAULT` on existing rows | ⚠️ | No CDC events for existing rows: they stay `NULL` until updated |
+`BACKWARD` = the new schema must be able to read data written with the old schema.
+
+| Change | Supported? | Note |
+|---|---|---|
+| Remove a field | ✅ | The new reader just ignores it in old data |
+| Add a field **with** an Avro default | ✅ | When old data lacks the field, the reader fills in the default |
+| Add a field **without** a default | 🚫 | Old data has no value for it, so the reader fails |
+| `int` → `long` | ✅ | Avro allows this type promotion |
+| `int` → `string` | 🚫 | Avro doesn't allow this promotion |
 
 CDC events (default replica identity): **updates** carry `before = null`; **deletes** carry the
 key in `before`, with `NOT NULL` columns as placeholders (`0`) and nullable ones `NULL`.

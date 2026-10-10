@@ -21,9 +21,9 @@ WITH parsed AS (
         ts_ms
     FROM lakehouse.bronze.order_items
     {% if is_incremental() %}
-    -- Only events newer than silver's watermark, minus a lookback for late bronze
-    -- commits. ts_ms (arrival order), not LSN: a lower LSN can arrive after a higher one.
-    WHERE ts_ms > (SELECT COALESCE(MAX(_cdc_ts_ms), 0) FROM {{ this }}) - {{ var('cdc_lookback_ms') }}
+    -- Only events at or after silver's watermark. ts_ms (arrival order), not LSN: a lower
+    -- LSN can arrive after a higher one. `>=` re-reads same-ms events split across commits.
+    WHERE ts_ms >= (SELECT COALESCE(MAX(_cdc_ts_ms), 0) FROM {{ this }})
     {% endif %}
 ),
 

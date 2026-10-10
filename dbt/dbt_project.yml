@@ -12,6 +12,3 @@ target-path: "target"
 clean-targets:
   - "target"
   - "dbt_packages"
-
-vars:
-  cdc_lookback_ms: 3600000   # 1h re-read window for incremental silver (used by the silver models)
